@@ -1,24 +1,32 @@
-package main
+package sraft
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/rpc"
 	"time"
 )
 
-type node struct {
-	connect bool
-	address string
+type Node struct {
+	*net.TCPAddr
 }
 
 // 新建节点
-func newNode(address string) *node {
-	node := &node{}
-	node.address = address
-	return node
+func NewNode(address string) (*Node, error) {
+	addr, err := net.ResolveTCPAddr("tcp4", address)
+	if err != nil {
+		return nil, err
+	}
+
+	node := &Node{
+		TCPAddr: addr,
+	}
+
+	return node, nil
 }
 
 // State def
@@ -42,7 +50,7 @@ type LogEntry struct {
 type Raft struct {
 	me int
 
-	nodes map[int]*node
+	nodes map[int]*Node
 
 	state       State
 	currentTerm int
@@ -86,6 +94,19 @@ func (rf *Raft) RequestVote(args VoteArgs, reply *VoteReply) error {
 	return nil
 }
 
+func NewRaftNode(ctx context.Context, id int, addr *net.TCPAddr, nodes map[int]*Node) (*Raft, error) {
+	r := &Raft{
+		me:    id,
+		nodes: nodes,
+	}
+
+	if err := r.rpc(ctx, addr); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
 // Heartbeat rpc method
 func (rf *Raft) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 
@@ -124,18 +145,38 @@ func (rf *Raft) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 	return nil
 }
 
-func (rf *Raft) rpc(port string) {
-	rpc.Register(rf)
+func (rf *Raft) rpc(ctx context.Context, addr *net.TCPAddr) error {
+	if err := rpc.Register(rf); err != nil {
+		return err
+	}
+
 	rpc.HandleHTTP()
+
+	serve := http.Server{
+		Addr: addr.String(),
+	}
+
 	go func() {
-		err := http.ListenAndServe(port, nil)
-		if err != nil {
+		<-ctx.Done()
+		ctx, cancel := context.WithCancel(context.TODO())
+		go func() {
+			<-time.After(5 * time.Second)
+			cancel()
+		}()
+		serve.Shutdown(ctx)
+	}()
+
+	go func() {
+		err := http.ListenAndServe(addr.String(), nil)
+		if err != nil && ctx.Err() == nil {
 			log.Fatal("listen error: ", err)
 		}
 	}()
+
+	return nil
 }
 
-func (rf *Raft) start() {
+func (rf *Raft) Start(ctx context.Context) {
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
@@ -144,7 +185,7 @@ func (rf *Raft) start() {
 
 	go func() {
 
-		rand.Seed(time.Now().UnixNano())
+		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 		for {
 			switch rf.state {
@@ -152,9 +193,11 @@ func (rf *Raft) start() {
 				select {
 				case <-rf.heartbeatC:
 					log.Printf("follower-%d recived heartbeat\n", rf.me)
-				case <-time.After(time.Duration(rand.Intn(500-300)+300) * time.Millisecond):
+				case <-time.After(time.Duration(rnd.Intn(500-300)+300) * time.Millisecond):
 					log.Printf("follower-%d timeout\n", rf.me)
 					rf.state = Candidate
+				case <-ctx.Done():
+					return
 				}
 			case Candidate:
 				fmt.Printf("Node: %d, I'm candidate\n", rf.me)
@@ -164,7 +207,7 @@ func (rf *Raft) start() {
 				go rf.broadcastRequestVote()
 
 				select {
-				case <-time.After(time.Duration(rand.Intn(500-300)+300) * time.Millisecond):
+				case <-time.After(time.Duration(rnd.Intn(500-300)+300) * time.Millisecond):
 					rf.state = Follower
 				case <-rf.toLeaderC:
 					fmt.Printf("Node: %d, I'm leader\n", rf.me)
@@ -182,10 +225,16 @@ func (rf *Raft) start() {
 						i := 0
 						for {
 							i++
-							rf.log = append(rf.log, LogEntry{rf.currentTerm, i, fmt.Sprintf("user send : %d", i)})
-							time.Sleep(3 * time.Second)
+							select {
+							case <-time.After(3 * time.Second):
+								rf.log = append(rf.log, LogEntry{rf.currentTerm, i, fmt.Sprintf("user send : %d", i)})
+							case <-ctx.Done():
+								return
+							}
 						}
 					}()
+				case <-ctx.Done():
+					return
 				}
 			case Leader:
 				rf.broadcastHeartbeat()
@@ -222,7 +271,7 @@ func (rf *Raft) broadcastRequestVote() {
 }
 
 func (rf *Raft) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
-	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
+	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].String())
 	if err != nil {
 		log.Fatal("dialing: ", err)
 	}
@@ -241,7 +290,7 @@ func (rf *Raft) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
 	if reply.VoteGranted {
 		rf.voteCount++
 	}
-	
+
 	if rf.voteCount >= len(rf.nodes)/2+1 {
 		rf.toLeaderC <- true
 	}
@@ -295,7 +344,7 @@ func (rf *Raft) broadcastHeartbeat() {
 }
 
 func (rf *Raft) sendHeartbeat(serverID int, args HeartbeatArgs, reply *HeartbeatReply) {
-	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
+	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].String())
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
